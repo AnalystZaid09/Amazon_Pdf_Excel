@@ -4,7 +4,6 @@ import pandas as pd
 import re
 from io import BytesIO
 
-# ---------------- PAGE CONFIG ---------------- #
 st.set_page_config(page_title="Amazon Invoice PDF → Excel", layout="wide")
 st.title("📄 Amazon Invoice PDF → Excel Extractor")
 
@@ -15,7 +14,6 @@ def extract_pdf(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         lines = []
 
-        # Read all lines safely
         for page in pdf.pages:
             text = page.extract_text()
             if text:
@@ -34,35 +32,36 @@ def extract_pdf(pdf_file):
         invoice_period = invoice_period.group(1).strip() if invoice_period else ""
         total_amount = float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
 
-        # -------- STATE-BASED CAMPAIGN PARSER -------- #
+        # -------- TABLE-ROW RECONSTRUCTION -------- #
         buffer = ""
 
         for line in lines:
             buffer = f"{buffer} {line}".strip()
 
+            # Tail pattern = sponsored + numbers
             match = re.search(
-                r"^(.*?)\s+"
-                r"(SPONSORED PRODUCTS|SPONSORED DISPLAY|SPONSORED BRANDS)\s+"
+                r"(SPONSORED PRODUCTS|SPONSORED BRANDS|SPONSORED DISPLAY)\s+"
                 r"(-?\d+)\s+"
                 r"([\d\.]+)\s+INR\s+"
-                r"(-?[\d\.]+)\s+INR",
+                r"(-?[\d\.]+)\s+INR$",
                 buffer
             )
 
             if match:
+                campaign_name = buffer[:match.start()].strip()
+
                 rows.append({
-                    "Campaign": match.group(1).strip(),
-                    "Campaign Type": match.group(2),
-                    "Clicks": int(match.group(3)),
-                    "Average CPC": float(match.group(4)),
-                    "Amount": float(match.group(5)),   # Campaign amount
+                    "Campaign": campaign_name,
+                    "Campaign Type": match.group(1),
+                    "Clicks": int(match.group(2)),
+                    "Average CPC": float(match.group(3)),
+                    "Amount": float(match.group(4)),
                     "Invoice Number": invoice_number,
                     "Invoice Period": invoice_period,
                     "Amount (Total Amount)": total_amount
                 })
 
-                # Reset only AFTER complete row is captured
-                buffer = ""
+                buffer = ""  # reset only after full row
 
     return pd.DataFrame(rows)
 
@@ -86,12 +85,11 @@ if st.button("🚀 Extract to Excel"):
         final_df = pd.concat(all_data, ignore_index=True)
 
         if final_df.empty:
-            st.error("❌ No campaign data extracted. Please verify PDF format.")
+            st.error("❌ No campaign data extracted.")
         else:
             st.success("✅ Data extracted successfully")
             st.dataframe(final_df)
 
-            # -------- Excel Export -------- #
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 final_df.to_excel(
