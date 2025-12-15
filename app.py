@@ -1,14 +1,18 @@
+import streamlit as st
 import camelot
 import pandas as pd
 import re
+from io import BytesIO
+import tempfile
 import os
 
-PDF_FOLDER = "pdfs"
-OUTPUT_FILE = "Amazon_Invoice_Data.xlsx"
+st.set_page_config(page_title="Amazon Invoice PDF → Excel", layout="wide")
+st.title("📄 Amazon Invoice PDF → Excel (Table Accurate)")
 
 def extract_invoice(pdf_path):
-    rows = []
+    all_rows = []
 
+    # ---- Extract tables (border based) ----
     tables = camelot.read_pdf(
         pdf_path,
         pages="all",
@@ -16,6 +20,7 @@ def extract_invoice(pdf_path):
         strip_text="\n"
     )
 
+    # ---- Extract invoice-level data ----
     text_tables = camelot.read_pdf(pdf_path, pages="1", flavor="stream")
     full_text = " ".join(text_tables[0].df.astype(str).values.flatten())
 
@@ -27,8 +32,10 @@ def extract_invoice(pdf_path):
     invoice_period = invoice_period.group(1).strip() if invoice_period else ""
     total_amount = float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
 
+    # ---- Parse campaign tables ----
     for table in tables:
         df = table.df
+
         if df.shape[1] < 5:
             continue
 
@@ -40,7 +47,7 @@ def extract_invoice(pdf_path):
 
         for _, row in df.iterrows():
             try:
-                rows.append({
+                all_rows.append({
                     "Campaign": row["Campaign"].replace("\n", " ").strip(),
                     "Campaign Type": row["Campaign Type"].strip(),
                     "Clicks": int(row["Clicks"]),
@@ -53,15 +60,41 @@ def extract_invoice(pdf_path):
             except:
                 continue
 
-    return rows
+    return pd.DataFrame(all_rows)
 
-all_rows = []
+# ---------------- UI ----------------
+uploaded_files = st.file_uploader(
+    "Upload Amazon Invoice PDFs",
+    type="pdf",
+    accept_multiple_files=True
+)
 
-for file in os.listdir(PDF_FOLDER):
-    if file.lower().endswith(".pdf"):
-        all_rows.extend(extract_invoice(os.path.join(PDF_FOLDER, file)))
+if st.button("🚀 Extract to Excel"):
+    if not uploaded_files:
+        st.warning("Upload at least one PDF")
+    else:
+        all_data = []
 
-df = pd.DataFrame(all_rows)
-df.to_excel(OUTPUT_FILE, index=False)
+        for pdf in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(pdf.read())
+                tmp_path = tmp.name
 
-print("✅ Excel generated:", OUTPUT_FILE)
+            all_data.append(extract_invoice(tmp_path))
+            os.remove(tmp_path)
+
+        final_df = pd.concat(all_data, ignore_index=True)
+
+        st.success("✅ Data extracted exactly like PDF")
+        st.dataframe(final_df)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            final_df.to_excel(writer, index=False, sheet_name="Campaign_Data")
+
+        st.download_button(
+            "⬇️ Download Excel",
+            data=output.getvalue(),
+            file_name="Amazon_Invoice_Data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
