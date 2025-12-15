@@ -4,6 +4,7 @@ import pandas as pd
 import re
 from io import BytesIO
 
+# ---------------- PAGE CONFIG ---------------- #
 st.set_page_config(page_title="Amazon Invoice PDF → Excel", layout="wide")
 st.title("📄 Amazon Invoice PDF → Excel Extractor")
 
@@ -12,14 +13,15 @@ def extract_pdf(pdf_file):
     rows = []
 
     with pdfplumber.open(pdf_file) as pdf:
-        raw_lines = []
+        lines = []
 
+        # Read all lines safely
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                raw_lines.extend(text.split("\n"))
+                lines.extend([l.strip() for l in text.split("\n") if l.strip()])
 
-        full_text = "\n".join(raw_lines)
+        full_text = "\n".join(lines)
 
         # -------- Invoice-level fields -------- #
         invoice_number = re.search(r"Invoice Number:\s*(\S+)", full_text)
@@ -30,32 +32,13 @@ def extract_pdf(pdf_file):
 
         invoice_number = invoice_number.group(1) if invoice_number else ""
         invoice_period = invoice_period.group(1).strip() if invoice_period else ""
-        total_amount = (
-            float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
-        )
+        total_amount = float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
 
-        # -------- FIX: MERGE MULTI-LINE CAMPAIGNS -------- #
-        merged_lines = []
+        # -------- STATE-BASED CAMPAIGN PARSER -------- #
         buffer = ""
 
-        for line in raw_lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            if any(x in line for x in [
-                "SPONSORED PRODUCTS",
-                "SPONSORED BRANDS",
-                "SPONSORED DISPLAY"
-            ]):
-                buffer = f"{buffer} {line}".strip()
-                merged_lines.append(buffer)
-                buffer = ""
-            else:
-                buffer = f"{buffer} {line}".strip()
-
-        # -------- Campaign extraction -------- #
-        for line in merged_lines:
+        for line in lines:
+            buffer = f"{buffer} {line}".strip()
 
             match = re.search(
                 r"^(.*?)\s+"
@@ -63,7 +46,7 @@ def extract_pdf(pdf_file):
                 r"(-?\d+)\s+"
                 r"([\d\.]+)\s+INR\s+"
                 r"(-?[\d\.]+)\s+INR",
-                line
+                buffer
             )
 
             if match:
@@ -72,11 +55,14 @@ def extract_pdf(pdf_file):
                     "Campaign Type": match.group(2),
                     "Clicks": int(match.group(3)),
                     "Average CPC": float(match.group(4)),
-                    "Amount": float(match.group(5)),  # Campaign Amount
+                    "Amount": float(match.group(5)),   # Campaign amount
                     "Invoice Number": invoice_number,
                     "Invoice Period": invoice_period,
                     "Amount (Total Amount)": total_amount
                 })
+
+                # Reset only AFTER complete row is captured
+                buffer = ""
 
     return pd.DataFrame(rows)
 
@@ -100,11 +86,12 @@ if st.button("🚀 Extract to Excel"):
         final_df = pd.concat(all_data, ignore_index=True)
 
         if final_df.empty:
-            st.error("❌ No campaign data found. Please check PDF format.")
+            st.error("❌ No campaign data extracted. Please verify PDF format.")
         else:
             st.success("✅ Data extracted successfully")
             st.dataframe(final_df)
 
+            # -------- Excel Export -------- #
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 final_df.to_excel(
