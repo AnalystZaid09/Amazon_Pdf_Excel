@@ -4,7 +4,6 @@ import pandas as pd
 import re
 from io import BytesIO
 
-# ---------------- PAGE CONFIG ---------------- #
 st.set_page_config(page_title="Amazon Invoice PDF → Excel", layout="wide")
 st.title("📄 Amazon Invoice PDF → Excel Extractor")
 
@@ -13,12 +12,14 @@ def extract_pdf(pdf_file):
     rows = []
 
     with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
+        raw_lines = []
 
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                full_text += text + "\n"
+                raw_lines.extend(text.split("\n"))
+
+        full_text = "\n".join(raw_lines)
 
         # -------- Invoice-level fields -------- #
         invoice_number = re.search(r"Invoice Number:\s*(\S+)", full_text)
@@ -33,11 +34,28 @@ def extract_pdf(pdf_file):
             float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
         )
 
-        # -------- Campaign line extraction -------- #
-        for line in full_text.split("\n"):
+        # -------- FIX: MERGE MULTI-LINE CAMPAIGNS -------- #
+        merged_lines = []
+        buffer = ""
 
-            # Example line:
-            # 24/6/2024_SPAT_B08SKBMYSG SPONSORED PRODUCTS 2 6.67 INR 13.34 INR
+        for line in raw_lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            if any(x in line for x in [
+                "SPONSORED PRODUCTS",
+                "SPONSORED BRANDS",
+                "SPONSORED DISPLAY"
+            ]):
+                buffer = f"{buffer} {line}".strip()
+                merged_lines.append(buffer)
+                buffer = ""
+            else:
+                buffer = f"{buffer} {line}".strip()
+
+        # -------- Campaign extraction -------- #
+        for line in merged_lines:
 
             match = re.search(
                 r"^(.*?)\s+"
@@ -51,10 +69,10 @@ def extract_pdf(pdf_file):
             if match:
                 rows.append({
                     "Campaign": match.group(1).strip(),
-                    "Campaign Type": match.group(2).strip(),
+                    "Campaign Type": match.group(2),
                     "Clicks": int(match.group(3)),
                     "Average CPC": float(match.group(4)),
-                    "Amount": float(match.group(5)),  # Campaign amount
+                    "Amount": float(match.group(5)),  # Campaign Amount
                     "Invoice Number": invoice_number,
                     "Invoice Period": invoice_period,
                     "Amount (Total Amount)": total_amount
@@ -87,7 +105,6 @@ if st.button("🚀 Extract to Excel"):
             st.success("✅ Data extracted successfully")
             st.dataframe(final_df)
 
-            # -------- Excel Export -------- #
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 final_df.to_excel(
