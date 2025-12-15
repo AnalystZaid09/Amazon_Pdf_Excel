@@ -11,6 +11,33 @@ st.title("📄 Amazon Invoice PDF → Excel Extractor")
 def extract_pdf(pdf_file):
     rows = []
 
+    IGNORE_KEYWORDS = [
+        "total (tax included)",
+        "campaign charges",
+        "portfolio total",
+        "summary of",
+        "invoice number",
+        "invoice date",
+        "invoice period",
+        "payment type",
+        "from ",
+        "this is a digitally signed",
+        "frequently asked",
+    ]
+
+    # New campaign start patterns (VERY IMPORTANT)
+    CAMPAIGN_START_PATTERNS = [
+        r"^SP/",
+        r"^SPPT/",
+        r"^SPAuto/",
+        r"^SBV-",
+        r"^\d{1,2}/\d{1,2}/\d{4}_",
+        r"^B0[A-Z0-9]{8,}"
+    ]
+
+    def is_new_campaign(line):
+        return any(re.match(p, line) for p in CAMPAIGN_START_PATTERNS)
+
     with pdfplumber.open(pdf_file) as pdf:
         lines = []
 
@@ -32,18 +59,28 @@ def extract_pdf(pdf_file):
         invoice_period = invoice_period.group(1).strip() if invoice_period else ""
         total_amount = float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
 
-        # -------- TABLE-ROW RECONSTRUCTION -------- #
+        # -------- SMART STATE PARSER -------- #
         buffer = ""
 
         for line in lines:
-            buffer = f"{buffer} {line}".strip()
+            low = line.lower()
 
-            # Tail pattern = sponsored + numbers
+            # Skip invoice garbage
+            if any(k in low for k in IGNORE_KEYWORDS):
+                continue
+
+            # 🚨 NEW CAMPAIGN DETECTED BEFORE PREVIOUS CLOSED
+            if buffer and is_new_campaign(line):
+                buffer = line
+            else:
+                buffer = f"{buffer} {line}".strip()
+
+            # Look for full row tail
             match = re.search(
                 r"(SPONSORED PRODUCTS|SPONSORED BRANDS|SPONSORED DISPLAY)\s+"
-                r"(-?\d+)\s+"
+                r"(\d+)\s+"
                 r"([\d\.]+)\s+INR\s+"
-                r"(-?[\d\.]+)\s+INR$",
+                r"([\d\.]+)\s+INR$",
                 buffer
             )
 
@@ -61,7 +98,7 @@ def extract_pdf(pdf_file):
                     "Amount (Total Amount)": total_amount
                 })
 
-                buffer = ""  # reset only after full row
+                buffer = ""  # reset safely
 
     return pd.DataFrame(rows)
 
@@ -79,15 +116,14 @@ if st.button("🚀 Extract to Excel"):
         all_data = []
 
         for pdf in uploaded_files:
-            df = extract_pdf(pdf)
-            all_data.append(df)
+            all_data.append(extract_pdf(pdf))
 
         final_df = pd.concat(all_data, ignore_index=True)
 
         if final_df.empty:
             st.error("❌ No campaign data extracted.")
         else:
-            st.success("✅ Data extracted successfully")
+            st.success("✅ Data extracted correctly")
             st.dataframe(final_df)
 
             output = BytesIO()
