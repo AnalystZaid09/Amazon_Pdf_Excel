@@ -1,100 +1,165 @@
+# Original -gem.py
 import streamlit as st
-import camelot
 import pandas as pd
+import pypdf
 import re
-from io import BytesIO
-import tempfile
-import os
+import io
 
-st.set_page_config(page_title="Amazon Invoice PDF → Excel", layout="wide")
-st.title("📄 Amazon Invoice PDF → Excel (Table Accurate)")
+# --- DATA ENGINEERING LOGIC ---
 
-def extract_invoice(pdf_path):
-    all_rows = []
+def clean_campaign_name_final(name_list):
+    """Joins fragments and strictly removes 'Exclusive)' noise."""
+    full_name = " ".join(name_list).strip()
+    
+    # Cleaning patterns for 'Exclusive)' and common PDF noise
+    noise_patterns = [
+        r"\(?Exclusive\)?",              # Removes 'Exclusive)', '(Exclusive)', etc.
+        r"Total amount billed.*INR",
+        r"Total adjustments.*INR",
+        r"Total amount tax included.*INR",
+        r"Portfolio name.*?:",
+        r"Page \d+ of \d+",
+        r"Amazon Seller Services.*",
+        r"8th Floor, Brigade GateWay.*",
+        r"Trade Center, No 26/1.*",
+        r"Dr Raj Kumar Road.*",
+        r"Malleshwaram.*",
+        r"Bangalore, Karnataka.*",
+        r"Summary of Portfolio Charges.*",
+        r"Campaign\s+Campaign Type\s+Clicks.*"
+    ]
+    
+    for pattern in noise_patterns:
+        full_name = re.sub(pattern, "", full_name, flags=re.IGNORECASE)
+    
+    return full_name.replace("  ", " ").strip(" :,\"")
 
-    # ---- Extract tables (border based) ----
-    tables = camelot.read_pdf(
-        pdf_path,
-        pages="all",
-        flavor="lattice",
-        strip_text="\n"
+def get_total_amount_from_bottom(reader):
+    """
+    Extracts 'Total Amount (tax included)' from ANY invoice layout.
+    Handles boxes, tables, line breaks, INR before/after value.
+    """
+
+    full_text = ""
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            full_text += text + "\n"
+
+    # Normalize text
+    flat = (
+        full_text
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace(",", "")
+        .lower()
     )
 
-    # ---- Extract invoice-level data ----
-    text_tables = camelot.read_pdf(pdf_path, pages="1", flavor="stream")
-    full_text = " ".join(text_tables[0].df.astype(str).values.flatten())
+    patterns = [
+        # Total Amount (tax included) 2418.16 INR
+        r"total\s*amount\s*\(tax\s*included\)\s*([\d]+\.\d{1,2})",
 
-    invoice_number = re.search(r"Invoice Number:\s*(\S+)", full_text)
-    invoice_period = re.search(r"Invoice Period:\s*(.+?)Payment", full_text)
-    total_amount = re.search(r"Total \(tax included\)\s*INR\s*([\d,\.]+)", full_text)
+        # Total Amount tax included 2418.16
+        r"total\s*amount\s*tax\s*included\s*([\d]+\.\d{1,2})",
 
-    invoice_number = invoice_number.group(1) if invoice_number else ""
-    invoice_period = invoice_period.group(1).strip() if invoice_period else ""
-    total_amount = float(total_amount.group(1).replace(",", "")) if total_amount else 0.0
+        # Total Amount (tax included)\s+INR\s+2418.16
+        r"total\s*amount\s*\(tax\s*included\)\s*inr\s*([\d]+\.\d{1,2})",
 
-    # ---- Parse campaign tables ----
-    for table in tables:
-        df = table.df
+        # Box format: Total Amount (tax included)   2418.16 INR
+        r"total\s*amount.*?tax\s*included.*?([\d]+\.\d{1,2})\s*inr",
 
-        if df.shape[1] < 5:
-            continue
+        # Fallback – last occurrence near bottom
+        r"total\s*amount.*?([\d]+\.\d{1,2})\s*inr"
+    ]
 
-        df.columns = df.iloc[0]
-        df = df.iloc[1:]
+    for pattern in patterns:
+        match = re.search(pattern, flat, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
 
-        if "Campaign" not in df.columns:
-            continue
+    raise ValueError("❌ 'Total Amount (tax included)' not found in invoice")
 
-        for _, row in df.iterrows():
-            try:
-                all_rows.append({
-                    "Campaign": row["Campaign"].replace("\n", " ").strip(),
-                    "Campaign Type": row["Campaign Type"].strip(),
-                    "Clicks": int(row["Clicks"]),
-                    "Average CPC": float(row["Average CPC"].replace("INR", "").strip()),
-                    "Amount": float(row["Amount"].replace("INR", "").strip()),
-                    "Invoice Number": invoice_number,
-                    "Invoice Period": invoice_period,
-                    "Amount (Total Amount)": total_amount
-                })
-            except:
+
+
+def process_invoice(pdf_file):
+    reader = pypdf.PdfReader(pdf_file)
+    final_total = get_total_amount_from_bottom(reader)
+    
+    first_page_text = reader.pages[0].extract_text().replace('\n', ' ')
+    inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
+    inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
+    
+    meta = {
+        "num": inv_num.group(1).strip() if inv_num else "N/A",
+        "date": inv_date.group(1).strip() if inv_date else "N/A",
+        "total": float(final_total)
+    }
+    
+    rows = []
+    name_accum = []
+    is_table = False
+
+    for page in reader.pages:
+        lines = page.extract_text().split('\n')
+        for line in lines:
+            line = line.strip()
+            if "Campaign" in line and "Clicks" in line:
+                is_table = True
+                name_accum = [] 
                 continue
+            
+            if not is_table: continue
 
-    return pd.DataFrame(all_rows)
+            # REGEX: Handles Negative Signs (-) and correctly separates values from names
+            metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
+            
+            if metric_match:
+                name_part = line[:metric_match.start()].strip()
+                if name_part:
+                    name_accum.append(name_part)
+                
+                rows.append({
+                    "Campaign": clean_campaign_name_final(name_accum),
+                    "Campaign Type": metric_match.group(1),
+                    "Clicks": int(metric_match.group(2)),
+                    "Average CPC": float(metric_match.group(3).replace(',', '')),
+                    "Amount": float(metric_match.group(4).replace(',', '')),
+                    "Invoice Number": meta["num"],
+                    "Invoice date": meta["date"],
+                    "Total Amount (tax included)": meta["total"]
+                })
+                name_accum = []
+            else:
+                # Clear buffer if metadata/address appears
+                if any(k in line for k in ["FROM", "Trade Center", "Invoice Number", "Summary"]):
+                    name_accum = []
+                    continue
+                name_accum.append(line)
 
-# ---------------- UI ----------------
-uploaded_files = st.file_uploader(
-    "Upload Amazon Invoice PDFs",
-    type="pdf",
-    accept_multiple_files=True
-)
+    return rows
 
-if st.button("🚀 Extract to Excel"):
-    if not uploaded_files:
-        st.warning("Upload at least one PDF")
-    else:
-        all_data = []
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Invoice Data Master", layout="wide")
+st.title("📂 Multi-Invoice Master (Fixed Total & Name Cleaning)")
+st.info("Resolved: Pulling Total Amount from the Bottom Summary and removing 'Exclusive)' prefix.")
 
-        for pdf in uploaded_files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(pdf.read())
-                tmp_path = tmp.name
+uploaded_files = st.file_uploader("Upload all PDF Invoices", type="pdf", accept_multiple_files=True)
 
-            all_data.append(extract_invoice(tmp_path))
-            os.remove(tmp_path)
+if uploaded_files:
+    combined_data = []
+    for f in uploaded_files:
+        with st.status(f"Processing {f.name}..."):
+            combined_data.extend(process_invoice(f))
+    
+    if combined_data:
+        df = pd.DataFrame(combined_data)
+        # Final Format alignment
+        df = df[["Campaign", "Campaign Type", "Clicks", "Average CPC", "Amount", 
+                 "Invoice Number", "Invoice date", "Total Amount (tax included)"]]
+        
+        st.success(f"Successfully processed {len(uploaded_files)} files.")
+        st.dataframe(df, use_container_width=True)
 
-        final_df = pd.concat(all_data, ignore_index=True)
-
-        st.success("✅ Data extracted exactly like PDF")
-        st.dataframe(final_df)
-
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            final_df.to_excel(writer, index=False, sheet_name="Campaign_Data")
-
-        st.download_button(
-            "⬇️ Download Excel",
-            data=output.getvalue(),
-            file_name="Amazon_Invoice_Data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        buffer = io.BytesIO()
+        df.to_excel(buffer, index=False)
+        st.download_button("📥 Download Master Excel", buffer.getvalue(), "Combined_Invoices.xlsx")
