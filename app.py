@@ -168,80 +168,79 @@ def process_invoice(pdf_file):
                     name_accum.append(line)
         # Trigger fallback if no rows found (silent extraction failure)
         if not rows:
-            st.warning(f"pypdf found no campaign data in {pdf_file.name}. Falling back...")
             raise ValueError("pypdf returned no data")
             
-        return rows
+        return rows, "pypdf"
 
     except Exception as e:
         # Fallback to pdfplumber for robustness (using extract_table for accuracy)
         pdf_file.seek(0)
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            # Metadata still extracted from full text (standard regex works well enough for single values)
-            full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
-            final_total = get_total_amount_from_bottom(pdf)
-            
-            first_page_text = (pdf.pages[0].extract_text() or "").replace('\n', ' ')
-            inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
-            inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
-            
-            meta = {
-                "num": inv_num.group(1).strip() if inv_num else "N/A",
-                "date": inv_date.group(1).strip() if inv_date else "N/A",
-                "total": float(final_total)
-            }
-            
-            rows = []
-            for page in pdf.pages:
-                table = page.extract_table()
-                if not table:
-                    continue
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                # Metadata still extracted from full text (standard regex works well enough for single values)
+                full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+                final_total = get_total_amount_from_bottom(pdf)
                 
-                # Buffer for campaign names that might span multiple cells or rows
-                name_accum = []
+                first_page_text = (pdf.pages[0].extract_text() or "").replace('\n', ' ')
+                inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
+                inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
                 
-                for row in table:
-                    # Filter out None/empty cells and normalize
-                    clean_row = [str(cell).strip() if cell else "" for cell in row]
-                    row_str = " ".join(clean_row)
+                meta = {
+                    "num": inv_num.group(1).strip() if inv_num else "N/A",
+                    "date": inv_date.group(1).strip() if inv_date else "N/A",
+                    "total": float(final_total)
+                }
+                
+                rows = []
+                for page in pdf.pages:
+                    table = page.extract_table()
+                    if not table:
+                        continue
                     
-                    # Regex for metrics in table rows
-                    metric_match = re.search(
-                        r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)(?:\s*INR)?\s+(-?[\d,.]+)(?:\s*INR)?",
-                        row_str, re.IGNORECASE
-                    )
+                    # Buffer for campaign names that might span multiple cells or rows
+                    name_accum = []
                     
-                    if metric_match:
-                        # Extract name from the first part of the row or accumulated buffer
-                        # Usually, the name is in the first column or at the start of the row_str
-                        possible_name = row_str[:metric_match.start()].strip()
-                        if possible_name:
-                            name_accum.append(possible_name)
+                    for row in table:
+                        # Filter out None/empty cells and normalize
+                        clean_row = [str(cell).strip() if cell else "" for cell in row]
+                        row_str = " ".join(clean_row)
                         
-                        rows.append({
-                            "Campaign": clean_campaign_name_final(name_accum),
-                            "Campaign Type": metric_match.group(1).upper(),
-                            "Clicks": int(metric_match.group(2)),
-                            "Average CPC": float(metric_match.group(3).replace(',', '')),
-                            "Amount": float(metric_match.group(4).replace(',', '')),
-                            "Invoice Number": meta["num"],
-                            "Invoice date": meta["date"],
-                            "Total Amount (tax included)": meta["total"]
-                        })
-                        name_accum = []
-                    else:
-                        # If row contains "Campaign" headers or "FROM" / address noise, reset buffer
-                        if any(k in row_str.upper() for k in ["CAMPAIGN", "CLICKS", "FROM", "TRADE CENTER", "INVOICE NUMBER", "SUMMARY"]):
+                        # Regex for metrics in table rows
+                        metric_match = re.search(
+                            r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)(?:\s*INR)?\s+(-?[\d,.]+)(?:\s*INR)?",
+                            row_str, re.IGNORECASE
+                        )
+                        
+                        if metric_match:
+                            # Extract name from the first part of the row or accumulated buffer
+                            # Usually, the name is in the first column or at the start of the row_str
+                            possible_name = row_str[:metric_match.start()].strip()
+                            if possible_name:
+                                name_accum.append(possible_name)
+                            
+                            rows.append({
+                                "Campaign": clean_campaign_name_final(name_accum),
+                                "Campaign Type": metric_match.group(1).upper(),
+                                "Clicks": int(metric_match.group(2)),
+                                "Average CPC": float(metric_match.group(3).replace(',', '')),
+                                "Amount": float(metric_match.group(4).replace(',', '')),
+                                "Invoice Number": meta["num"],
+                                "Invoice date": meta["date"],
+                                "Total Amount (tax included)": meta["total"]
+                            })
                             name_accum = []
-                            continue
-                        # If it's a non-empty row without metrics, it might be a multi-line campaign name
-                        if any(c for c in clean_row if c):
-                            name_accum.append(row_str)
-            
-        # If still no rows, notify user
-        if not rows:
-            st.error(f"Failed to extract campaign data from {pdf_file.name} using both engines.")
-        return rows
+                        else:
+                            # If row contains "Campaign" headers or "FROM" / address noise, reset buffer
+                            if any(k in row_str.upper() for k in ["CAMPAIGN", "CLICKS", "FROM", "TRADE CENTER", "INVOICE NUMBER", "SUMMARY"]):
+                                name_accum = []
+                                continue
+                            # If it's a non-empty row without metrics, it might be a multi-line campaign name
+                            if any(c for c in clean_row if c):
+                                name_accum.append(row_str)
+                
+                return rows, ("fallback_success" if rows else "failed")
+        except Exception:
+            return [], "failed"
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Invoice Data Master", layout="wide")
@@ -252,19 +251,45 @@ uploaded_files = st.file_uploader("Upload all PDF Invoices", type="pdf", accept_
 
 if uploaded_files:
     combined_data = []
-    for f in uploaded_files:
-        with st.status(f"Processing {f.name}..."):
-            combined_data.extend(process_invoice(f))
+    status_history = []
     
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, f in enumerate(uploaded_files):
+        status_text.text(f"Processing ({i+1}/{len(uploaded_files)}): {f.name}")
+        rows, method = process_invoice(f)
+        
+        if method == "fallback_triggered":
+            # This happens when pypdf returns [], so we try fallback manually or handled inside
+            # Actually, I refactored it to handle internally. 
+            # Let's re-run with fallback if triggered.
+            # Fixed the logic in process_invoice to be cleaner.
+            pass
+            
+        combined_data.extend(rows)
+        status_history.append({"File": f.name, "Status": method, "Rows": len(rows)})
+        progress_bar.progress((i + 1) / len(uploaded_files))
+    
+    status_text.text("Processing Complete!")
+    
+    if status_history:
+        with st.expander("📊 View Detailed Processing Report"):
+            status_df = pd.DataFrame(status_history)
+            st.dataframe(status_df, use_container_width=True)
+
     if combined_data:
         df = pd.DataFrame(combined_data)
         # Final Format alignment
-        df = df[["Campaign", "Campaign Type", "Clicks", "Average CPC", "Amount", 
-                 "Invoice Number", "Invoice date", "Total Amount (tax included)"]]
+        cols = ["Campaign", "Campaign Type", "Clicks", "Average CPC", "Amount", 
+                "Invoice Number", "Invoice date", "Total Amount (tax included)"]
+        df = df[[c for c in cols if c in df.columns]]
         
-        st.success(f"Successfully processed {len(uploaded_files)} files.")
+        st.success(f"✅ Successfully processed {len(uploaded_files)} files. Total Rows: {len(df)}")
         st.dataframe(df, use_container_width=True)
 
         buffer = io.BytesIO()
         df.to_excel(buffer, index=False)
         st.download_button("📥 Download Master Excel", buffer.getvalue(), "Combined_Invoices.xlsx")
+    else:
+        st.error("❌ No data could be extracted from the uploaded files.")
