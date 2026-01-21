@@ -163,6 +163,10 @@ def process_invoice(pdf_file):
                         name_accum = []
                         continue
                     name_accum.append(line)
+        # Trigger fallback if no rows found (silent extraction failure)
+        if not rows:
+            raise ValueError("pypdf returned no data")
+            
         return rows
 
     except Exception as e:
@@ -243,7 +247,7 @@ if uploaded_files:
                  "Invoice Number", "Invoice date", "Total Amount (tax included)"]]
         
         st.success(f"Successfully processed {len(uploaded_files)} files.")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
 
         buffer = io.BytesIO()
         df.to_excel(buffer, index=False)
