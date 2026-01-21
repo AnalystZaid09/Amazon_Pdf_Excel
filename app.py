@@ -1,7 +1,8 @@
-# Original -gem.py
+# Original -gem_updated.py
 import streamlit as st
 import pandas as pd
 import pypdf
+import pdfplumber
 import re
 import io
 
@@ -34,17 +35,36 @@ def clean_campaign_name_final(name_list):
     
     return full_name.replace("  ", " ").strip(" :,\"")
 
-def get_total_amount_from_bottom(reader):
+def get_total_amount_from_bottom(pdf_obj):
     """
     Extracts 'Total Amount (tax included)' from ANY invoice layout.
     Handles boxes, tables, line breaks, INR before/after value.
     """
 
     full_text = ""
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            full_text += text + "\n"
+    # Try pypdf first
+    try:
+        for page in pdf_obj.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+    except Exception:
+        # Fallback if pypdf fails (e.g. KeyError: 'bbox')
+        full_text = ""
+        # We need to re-open with pdfplumber if pdf_obj is from pypdf
+        # But this function is called with different objects now.
+        # Let's simplify: the caller should handle the fallback if possible,
+        # or we try to detect the object type.
+        if hasattr(pdf_obj, 'stream'): # Likely pypdf
+            try:
+                with pdfplumber.open(pdf_obj.stream) as pl_pdf:
+                    for page in pl_pdf.pages:
+                        full_text += page.extract_text() + "\n"
+            except: pass
+        else: # Likely pdfplumber or similar
+            for page in pdf_obj.pages:
+                full_text += (page.extract_text() or "") + "\n"
+
 
     # Normalize text
     flat = (
@@ -82,61 +102,126 @@ def get_total_amount_from_bottom(reader):
 
 
 def process_invoice(pdf_file):
-    reader = pypdf.PdfReader(pdf_file)
-    final_total = get_total_amount_from_bottom(reader)
+    # Use bytes for both to avoid re-reading
+    pdf_bytes = pdf_file.read()
+    pdf_file.seek(0) # Reset for potential re-read if needed
     
-    first_page_text = reader.pages[0].extract_text().replace('\n', ' ')
-    inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
-    inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
-    
-    meta = {
-        "num": inv_num.group(1).strip() if inv_num else "N/A",
-        "date": inv_date.group(1).strip() if inv_date else "N/A",
-        "total": float(final_total)
-    }
-    
-    rows = []
-    name_accum = []
-    is_table = False
+    # Try with pypdf first for accuracy
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        final_total = get_total_amount_from_bottom(reader)
+        
+        first_page_text = reader.pages[0].extract_text() or ""
+        first_page_text = first_page_text.replace('\n', ' ')
+        
+        inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
+        inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
+        
+        meta = {
+            "num": inv_num.group(1).strip() if inv_num else "N/A",
+            "date": inv_date.group(1).strip() if inv_date else "N/A",
+            "total": float(final_total)
+        }
+        
+        rows = []
+        name_accum = []
+        is_table = False
 
-    for page in reader.pages:
-        lines = page.extract_text().split('\n')
-        for line in lines:
-            line = line.strip()
-            if "Campaign" in line and "Clicks" in line:
-                is_table = True
-                name_accum = [] 
-                continue
-            
-            if not is_table: continue
-
-            # REGEX: Handles Negative Signs (-) and correctly separates values from names
-            metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
-            
-            if metric_match:
-                name_part = line[:metric_match.start()].strip()
-                if name_part:
-                    name_accum.append(name_part)
-                
-                rows.append({
-                    "Campaign": clean_campaign_name_final(name_accum),
-                    "Campaign Type": metric_match.group(1),
-                    "Clicks": int(metric_match.group(2)),
-                    "Average CPC": float(metric_match.group(3).replace(',', '')),
-                    "Amount": float(metric_match.group(4).replace(',', '')),
-                    "Invoice Number": meta["num"],
-                    "Invoice date": meta["date"],
-                    "Total Amount (tax included)": meta["total"]
-                })
-                name_accum = []
-            else:
-                # Clear buffer if metadata/address appears
-                if any(k in line for k in ["FROM", "Trade Center", "Invoice Number", "Summary"]):
-                    name_accum = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if not text: continue
+            lines = text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if "Campaign" in line and "Clicks" in line:
+                    is_table = True
+                    name_accum = [] 
                     continue
-                name_accum.append(line)
+                
+                if not is_table: continue
 
-    return rows
+                metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
+                
+                if metric_match:
+                    name_part = line[:metric_match.start()].strip()
+                    if name_part:
+                        name_accum.append(name_part)
+                    
+                    rows.append({
+                        "Campaign": clean_campaign_name_final(name_accum),
+                        "Campaign Type": metric_match.group(1),
+                        "Clicks": int(metric_match.group(2)),
+                        "Average CPC": float(metric_match.group(3).replace(',', '')),
+                        "Amount": float(metric_match.group(4).replace(',', '')),
+                        "Invoice Number": meta["num"],
+                        "Invoice date": meta["date"],
+                        "Total Amount (tax included)": meta["total"]
+                    })
+                    name_accum = []
+                else:
+                    if any(k in line for k in ["FROM", "Trade Center", "Invoice Number", "Summary"]):
+                        name_accum = []
+                        continue
+                    name_accum.append(line)
+        return rows
+
+    except Exception as e:
+        # Fallback to pdfplumber for robustness
+        pdf_file.seek(0)
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            final_total = get_total_amount_from_bottom(pdf)
+            
+            first_page_text = (pdf.pages[0].extract_text() or "").replace('\n', ' ')
+            inv_num = re.search(r"Invoice Number\s*[:\s]*(\S+)", first_page_text)
+            inv_date = re.search(r"Invoice Date\s*[:\s]*(\d{2}-\d{2}-\d{4})", first_page_text)
+            
+            meta = {
+                "num": inv_num.group(1).strip() if inv_num else "N/A",
+                "date": inv_date.group(1).strip() if inv_date else "N/A",
+                "total": float(final_total)
+            }
+            
+            rows = []
+            name_accum = []
+            is_table = False
+
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text: continue
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if "Campaign" in line and "Clicks" in line:
+                        is_table = True
+                        name_accum = [] 
+                        continue
+                    
+                    if not is_table: continue
+
+                    metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
+                    
+                    if metric_match:
+                        name_part = line[:metric_match.start()].strip()
+                        if name_part:
+                            name_accum.append(name_part)
+                        
+                        rows.append({
+                            "Campaign": clean_campaign_name_final(name_accum),
+                            "Campaign Type": metric_match.group(1),
+                            "Clicks": int(metric_match.group(2)),
+                            "Average CPC": float(metric_match.group(3).replace(',', '')),
+                            "Amount": float(metric_match.group(4).replace(',', '')),
+                            "Invoice Number": meta["num"],
+                            "Invoice date": meta["date"],
+                            "Total Amount (tax included)": meta["total"]
+                        })
+                        name_accum = []
+                    else:
+                        if any(k in line for k in ["FROM", "Trade Center", "Invoice Number", "Summary"]):
+                            name_accum = []
+                            continue
+                        name_accum.append(line)
+        return rows
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Invoice Data Master", layout="wide")
