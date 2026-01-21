@@ -1,6 +1,5 @@
-streamlit
-pdfplumber
-pandas
-openpyxl
-pypdf
-
+streamlit==1.48.1
+pdfplumber==0.11.7
+pandas==2.3.3
+openpyxl==3.1.5
+pypdf==6.4.2
