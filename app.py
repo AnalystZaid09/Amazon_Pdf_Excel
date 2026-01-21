@@ -1,4 +1,4 @@
-# Original -gem_updated.py
+# Original -gem.py
 import streamlit as st
 import pandas as pd
 import pypdf
@@ -77,19 +77,22 @@ def get_total_amount_from_bottom(pdf_obj):
 
     patterns = [
         # Total Amount (tax included) 2418.16 INR
-        r"total\s*amount\s*\(tax\s*included\)\s*([\d]+\.\d{1,2})",
+        r"total\s*amount\s*\(tax\s*included\)\s*([\d,]+\.\d{2})",
 
-        # Total Amount tax included 2418.16
-        r"total\s*amount\s*tax\s*included\s*([\d]+\.\d{1,2})",
+        # Total tax included 2418.16
+        r"total\s*tax\s*included.*?([\d,]+\.\d{2})",
 
         # Total Amount (tax included)\s+INR\s+2418.16
-        r"total\s*amount\s*\(tax\s*included\)\s*inr\s*([\d]+\.\d{1,2})",
+        r"total\s*amount\s*\(tax\s*included\)\s*inr\s*([\d,]+\.\d{2})",
 
         # Box format: Total Amount (tax included)   2418.16 INR
-        r"total\s*amount.*?tax\s*included.*?([\d]+\.\d{1,2})\s*inr",
+        r"total\s*amount.*?tax\s*included.*?([\d,]+\.\d{2})",
+
+        # INR before number: Total tax included INR 2,762.17
+        r"total.*?tax\s*included.*?inr\s*([\d,]+\.\d{2})",
 
         # Fallback – last occurrence near bottom
-        r"total\s*amount.*?([\d]+\.\d{1,2})\s*inr"
+        r"total\s*amount.*?([\d,]+\.\d{2})"
     ]
 
     for pattern in patterns:
@@ -140,7 +143,7 @@ def process_invoice(pdf_file):
                 
                 if not is_table: continue
 
-                metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
+                metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)(?:\s*INR)?\s+(-?[\d,.]+)(?:\s*INR)?", line, re.IGNORECASE)
                 
                 if metric_match:
                     name_part = line[:metric_match.start()].strip()
@@ -165,14 +168,17 @@ def process_invoice(pdf_file):
                     name_accum.append(line)
         # Trigger fallback if no rows found (silent extraction failure)
         if not rows:
+            st.warning(f"pypdf found no campaign data in {pdf_file.name}. Falling back...")
             raise ValueError("pypdf returned no data")
             
         return rows
 
     except Exception as e:
-        # Fallback to pdfplumber for robustness
+        # Fallback to pdfplumber for robustness (using extract_table for accuracy)
         pdf_file.seek(0)
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # Metadata still extracted from full text (standard regex works well enough for single values)
+            full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
             final_total = get_total_amount_from_bottom(pdf)
             
             first_page_text = (pdf.pages[0].extract_text() or "").replace('\n', ' ')
@@ -186,32 +192,35 @@ def process_invoice(pdf_file):
             }
             
             rows = []
-            name_accum = []
-            is_table = False
-
             for page in pdf.pages:
-                text = page.extract_text()
-                if not text: continue
-                lines = text.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if "Campaign" in line and "Clicks" in line:
-                        is_table = True
-                        name_accum = [] 
-                        continue
+                table = page.extract_table()
+                if not table:
+                    continue
+                
+                # Buffer for campaign names that might span multiple cells or rows
+                name_accum = []
+                
+                for row in table:
+                    # Filter out None/empty cells and normalize
+                    clean_row = [str(cell).strip() if cell else "" for cell in row]
+                    row_str = " ".join(clean_row)
                     
-                    if not is_table: continue
-
-                    metric_match = re.search(r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)\s*INR\s+(-?[\d,.]+)\s*INR", line)
+                    # Regex for metrics in table rows
+                    metric_match = re.search(
+                        r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)(?:\s*INR)?\s+(-?[\d,.]+)(?:\s*INR)?",
+                        row_str, re.IGNORECASE
+                    )
                     
                     if metric_match:
-                        name_part = line[:metric_match.start()].strip()
-                        if name_part:
-                            name_accum.append(name_part)
+                        # Extract name from the first part of the row or accumulated buffer
+                        # Usually, the name is in the first column or at the start of the row_str
+                        possible_name = row_str[:metric_match.start()].strip()
+                        if possible_name:
+                            name_accum.append(possible_name)
                         
                         rows.append({
                             "Campaign": clean_campaign_name_final(name_accum),
-                            "Campaign Type": metric_match.group(1),
+                            "Campaign Type": metric_match.group(1).upper(),
                             "Clicks": int(metric_match.group(2)),
                             "Average CPC": float(metric_match.group(3).replace(',', '')),
                             "Amount": float(metric_match.group(4).replace(',', '')),
@@ -221,10 +230,17 @@ def process_invoice(pdf_file):
                         })
                         name_accum = []
                     else:
-                        if any(k in line for k in ["FROM", "Trade Center", "Invoice Number", "Summary"]):
+                        # If row contains "Campaign" headers or "FROM" / address noise, reset buffer
+                        if any(k in row_str.upper() for k in ["CAMPAIGN", "CLICKS", "FROM", "TRADE CENTER", "INVOICE NUMBER", "SUMMARY"]):
                             name_accum = []
                             continue
-                        name_accum.append(line)
+                        # If it's a non-empty row without metrics, it might be a multi-line campaign name
+                        if any(c for c in clean_row if c):
+                            name_accum.append(row_str)
+            
+        # If still no rows, notify user
+        if not rows:
+            st.error(f"Failed to extract campaign data from {pdf_file.name} using both engines.")
         return rows
 
 # --- STREAMLIT UI ---
@@ -247,7 +263,7 @@ if uploaded_files:
                  "Invoice Number", "Invoice date", "Total Amount (tax included)"]]
         
         st.success(f"Successfully processed {len(uploaded_files)} files.")
-        st.dataframe(df, width='stretch')
+        st.dataframe(df, use_container_width=True)
 
         buffer = io.BytesIO()
         df.to_excel(buffer, index=False)
