@@ -1,10 +1,16 @@
-# Original -gem.py
 import streamlit as st
 import pandas as pd
 import pypdf
 import pdfplumber
 import re
 import io
+
+# --- PAGE CONFIG ---
+st.set_page_config(
+    page_title="Invoice Data Master",
+    page_icon="📊",
+    layout="wide"
+)
 
 # --- DATA ENGINEERING LOGIC ---
 
@@ -51,10 +57,6 @@ def get_total_amount_from_bottom(pdf_obj):
     except Exception:
         # Fallback if pypdf fails (e.g. KeyError: 'bbox')
         full_text = ""
-        # We need to re-open with pdfplumber if pdf_obj is from pypdf
-        # But this function is called with different objects now.
-        # Let's simplify: the caller should handle the fallback if possible,
-        # or we try to detect the object type.
         if hasattr(pdf_obj, 'stream'): # Likely pypdf
             try:
                 with pdfplumber.open(pdf_obj.stream) as pl_pdf:
@@ -64,7 +66,6 @@ def get_total_amount_from_bottom(pdf_obj):
         else: # Likely pdfplumber or similar
             for page in pdf_obj.pages:
                 full_text += (page.extract_text() or "") + "\n"
-
 
     # Normalize text
     flat = (
@@ -76,22 +77,11 @@ def get_total_amount_from_bottom(pdf_obj):
     )
 
     patterns = [
-        # Total Amount (tax included) 2418.16 INR
         r"total\s*amount\s*\(tax\s*included\)\s*([\d,]+\.\d{2})",
-
-        # Total tax included 2418.16
         r"total\s*tax\s*included.*?([\d,]+\.\d{2})",
-
-        # Total Amount (tax included)\s+INR\s+2418.16
         r"total\s*amount\s*\(tax\s*included\)\s*inr\s*([\d,]+\.\d{2})",
-
-        # Box format: Total Amount (tax included)   2418.16 INR
         r"total\s*amount.*?tax\s*included.*?([\d,]+\.\d{2})",
-
-        # INR before number: Total tax included INR 2,762.17
         r"total.*?tax\s*included.*?inr\s*([\d,]+\.\d{2})",
-
-        # Fallback – last occurrence near bottom
         r"total\s*amount.*?([\d,]+\.\d{2})"
     ]
 
@@ -102,12 +92,10 @@ def get_total_amount_from_bottom(pdf_obj):
 
     raise ValueError("❌ 'Total Amount (tax included)' not found in invoice")
 
-
-
 def process_invoice(pdf_file):
     # Use bytes for both to avoid re-reading
     pdf_bytes = pdf_file.read()
-    pdf_file.seek(0) # Reset for potential re-read if needed
+    pdf_file.seek(0)
     
     # Try with pypdf first for accuracy
     try:
@@ -166,18 +154,17 @@ def process_invoice(pdf_file):
                         name_accum = []
                         continue
                     name_accum.append(line)
-        # Trigger fallback if no rows found (silent extraction failure)
+        
         if not rows:
             raise ValueError("pypdf returned no data")
             
         return rows, "pypdf"
 
     except Exception as e:
-        # Fallback to pdfplumber for robustness (using extract_table for accuracy)
+        # Fallback to pdfplumber
         pdf_file.seek(0)
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                # Metadata still extracted from full text (standard regex works well enough for single values)
                 full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
                 final_total = get_total_amount_from_bottom(pdf)
                 
@@ -197,23 +184,18 @@ def process_invoice(pdf_file):
                     if not table:
                         continue
                     
-                    # Buffer for campaign names that might span multiple cells or rows
                     name_accum = []
                     
                     for row in table:
-                        # Filter out None/empty cells and normalize
                         clean_row = [str(cell).strip() if cell else "" for cell in row]
                         row_str = " ".join(clean_row)
                         
-                        # Regex for metrics in table rows
                         metric_match = re.search(
                             r"(SPONSORED\s+(?:PRODUCTS|BRANDS|DISPLAY))\s+(-?\d+)\s+(-?[\d,.]+)(?:\s*INR)?\s+(-?[\d,.]+)(?:\s*INR)?",
                             row_str, re.IGNORECASE
                         )
                         
                         if metric_match:
-                            # Extract name from the first part of the row or accumulated buffer
-                            # Usually, the name is in the first column or at the start of the row_str
                             possible_name = row_str[:metric_match.start()].strip()
                             if possible_name:
                                 name_accum.append(possible_name)
@@ -230,11 +212,9 @@ def process_invoice(pdf_file):
                             })
                             name_accum = []
                         else:
-                            # If row contains "Campaign" headers or "FROM" / address noise, reset buffer
                             if any(k in row_str.upper() for k in ["CAMPAIGN", "CLICKS", "FROM", "TRADE CENTER", "INVOICE NUMBER", "SUMMARY"]):
                                 name_accum = []
                                 continue
-                            # If it's a non-empty row without metrics, it might be a multi-line campaign name
                             if any(c for c in clean_row if c):
                                 name_accum.append(row_str)
                 
@@ -243,11 +223,31 @@ def process_invoice(pdf_file):
             return [], "failed"
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Invoice Data Master", layout="wide")
-st.title("📂 Multi-Invoice Master (Fixed Total & Name Cleaning)")
-st.info("Resolved: Pulling Total Amount from the Bottom Summary and removing 'Exclusive)' prefix.")
+st.title("📊 Invoice Data Extractor (Amazon Support Advertisment)")
+st.markdown("### Process multiple PDF invoices with brand mapping and comprehensive reporting")
+st.markdown("---")
 
-uploaded_files = st.file_uploader("Upload all PDF Invoices", type="pdf", accept_multiple_files=True)
+# File uploaders
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("📁 Step 1: Upload Invoice PDFs")
+    uploaded_files = st.file_uploader(
+        "Upload all PDF Invoices", 
+        type="pdf", 
+        accept_multiple_files=True,
+        help="Upload one or more invoice PDF files"
+    )
+
+with col2:
+    st.subheader("📋 Step 2: Upload Portfolio Report")
+    portfolio_file = st.file_uploader(
+        "Upload Portfolio Report (Excel with Campaign & Brand Columns)",
+        type=["xlsx", "xls"],
+        help="Excel file containing campaign to brand mapping"
+    )
+
+st.markdown("---")
 
 if uploaded_files:
     combined_data = []
@@ -256,23 +256,17 @@ if uploaded_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # Process all invoices
     for i, f in enumerate(uploaded_files):
         status_text.text(f"Processing ({i+1}/{len(uploaded_files)}): {f.name}")
         rows, method = process_invoice(f)
-        
-        if method == "fallback_triggered":
-            # This happens when pypdf returns [], so we try fallback manually or handled inside
-            # Actually, I refactored it to handle internally. 
-            # Let's re-run with fallback if triggered.
-            # Fixed the logic in process_invoice to be cleaner.
-            pass
-            
         combined_data.extend(rows)
         status_history.append({"File": f.name, "Status": method, "Rows": len(rows)})
         progress_bar.progress((i + 1) / len(uploaded_files))
     
-    status_text.text("Processing Complete!")
+    status_text.text("✅ Processing Complete!")
     
+    # Show processing status
     if status_history:
         with st.expander("📊 View Detailed Processing Report"):
             status_df = pd.DataFrame(status_history)
@@ -280,16 +274,306 @@ if uploaded_files:
 
     if combined_data:
         df = pd.DataFrame(combined_data)
-        # Final Format alignment
+        
+        # Add With GST Column
+        df["With GST Amount (18%)"] = df["Amount"] * 1.18
+        
+        # Add Brand using Portfolio Report
+        if portfolio_file:
+            try:
+                portfolio_df = pd.read_excel(portfolio_file)
+
+                # Clean column names
+                portfolio_df.columns = (
+                    portfolio_df.columns
+                    .astype(str)
+                    .str.strip()
+                    .str.replace("\n", " ", regex=False)
+                    .str.replace("\r", " ", regex=False)
+                )
+
+                # Detect required columns
+                portfolio_col = None
+                brand_col = None
+                name_col = None
+
+                for col in portfolio_df.columns:
+                    col_lower = col.lower()
+                    if "portfolio" in col_lower:
+                        portfolio_col = col
+                    elif "brand" in col_lower:
+                        brand_col = col
+                    elif col_lower == "name" or col_lower.endswith(" name"):
+                        name_col = col
+
+                if portfolio_col and brand_col:
+                    # Rename dynamically
+                    rename_dict = {
+                        portfolio_col: "Campaign",
+                        brand_col: "Brand"
+                    }
+
+                    if name_col:
+                        rename_dict[name_col] = "Name"
+
+                    portfolio_df = portfolio_df.rename(columns=rename_dict)
+
+                    # Clean text for matching
+                    def clean_text(x):
+                        return str(x).lower().strip()
+
+                    df["Campaign_clean"] = df["Campaign"].apply(clean_text)
+                    portfolio_df["Campaign_clean"] = portfolio_df["Campaign"].apply(clean_text)
+
+                    # Keep only Brand & Name
+                    keep_cols = ["Campaign_clean", "Brand"]
+                    if "Name" in portfolio_df.columns:
+                        keep_cols.append("Name")
+
+                    portfolio_df = portfolio_df[keep_cols]
+                    portfolio_df = portfolio_df.drop_duplicates("Campaign_clean")
+
+                    # Merge
+                    df = df.merge(
+                        portfolio_df,
+                        on="Campaign_clean",
+                        how="left"
+                    )
+
+                    # Remove helper column
+                    df.drop(columns=["Campaign_clean"], inplace=True)
+                    
+                    st.success(f"✅ Portfolio mapping complete! {len(df[df['Brand'].notna()])} campaigns matched with brands.")
+
+                    # Show unmatched
+                    unmatched = df[df["Brand"].isna()]
+                    if not unmatched.empty:
+                        st.warning(f"⚠️ {len(unmatched)} campaigns not matched with brands.")
+                        with st.expander("View Unmatched Campaigns"):
+                            st.dataframe(unmatched[["Campaign"]].drop_duplicates())
+
+                else:
+                    st.error("❌ Could not detect Portfolio or Brand column in uploaded file.")
+
+            except Exception as e:
+                st.error(f"❌ Portfolio file processing failed: {str(e)}")
+
+        # Final column arrangement
         cols = ["Campaign", "Campaign Type", "Clicks", "Average CPC", "Amount", 
-                "Invoice Number", "Invoice date", "Total Amount (tax included)"]
+                "Invoice Number", "Invoice date", "Total Amount (tax included)", 
+                "With GST Amount (18%)", "Brand", "Name"]
         df = df[[c for c in cols if c in df.columns]]
         
-        st.success(f"✅ Successfully processed {len(uploaded_files)} files. Total Rows: {len(df)}")
-        st.dataframe(df, use_container_width=True)
-
-        buffer = io.BytesIO()
-        df.to_excel(buffer, index=False)
-        st.download_button("📥 Download Master Excel", buffer.getvalue(), "Combined_Invoices.xlsx")
+        # Sidebar for brand selection
+        st.sidebar.header("🎯 Filter Options")
+        
+        if "Brand" in df.columns:
+            brands = sorted(df["Brand"].dropna().unique().tolist())
+            selected_brands = st.sidebar.multiselect(
+                "Select Brand(s)",
+                options=brands,
+                default=brands,
+                help="Select one or more brands to filter the data"
+            )
+        else:
+            selected_brands = []
+        
+        # Create tabs for 3 reports
+        tab1, tab2, tab3 = st.tabs(["📋 Master Report", "🔍 Brand Filtered Report", "📊 Pivot Table Report"])
+        
+        # Helper function for Excel download
+        @st.cache_data
+        def convert_df_to_excel(dataframe, sheet_name='Report'):
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                dataframe.to_excel(writer, index=False, sheet_name=sheet_name)
+            return output.getvalue()
+        
+        # ============= TAB 1: MASTER REPORT =============
+        with tab1:
+            st.header("Master Report - All Invoices")
+            st.write(f"**Total Records:** {len(df)}")
+            st.write(f"**Total Files Processed:** {len(uploaded_files)}")
+            
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Campaigns", df["Campaign"].nunique())
+            with col2:
+                st.metric("Total Clicks", f"{df['Clicks'].sum():,}")
+            with col3:
+                st.metric("Total Amount", f"₹{df['Amount'].sum():,.2f}")
+            with col4:
+                st.metric("With GST", f"₹{df['With GST Amount (18%)'].sum():,.2f}")
+            
+            # Display data
+            st.dataframe(df, use_container_width=True, height=400)
+            
+            # Download button
+            excel_data = convert_df_to_excel(df, 'Master Report')
+            st.download_button(
+                label="📥 Download Master Report (Excel)",
+                data=excel_data,
+                file_name="invoice_master_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        
+        # ============= TAB 2: BRAND FILTERED REPORT =============
+        with tab2:
+            st.header("Brand Filtered Report")
+            
+            if "Brand" in df.columns and selected_brands:
+                # Filter data
+                filtered_df = df[df['Brand'].isin(selected_brands)].copy()
+                
+                st.write(f"**Selected Brands:** {', '.join(selected_brands)}")
+                st.write(f"**Filtered Records:** {len(filtered_df)}")
+                
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Campaigns", filtered_df["Campaign"].nunique())
+                with col2:
+                    st.metric("Total Clicks", f"{filtered_df['Clicks'].sum():,}")
+                with col3:
+                    st.metric("Total Amount", f"₹{filtered_df['Amount'].sum():,.2f}")
+                with col4:
+                    st.metric("With GST", f"₹{filtered_df['With GST Amount (18%)'].sum():,.2f}")
+                
+                # Display filtered data
+                st.dataframe(filtered_df, use_container_width=True, height=400)
+                
+                # Download button
+                filtered_excel = convert_df_to_excel(filtered_df, 'Filtered Report')
+                st.download_button(
+                    label="📥 Download Filtered Report (Excel)",
+                    data=filtered_excel,
+                    file_name=f"invoice_filtered_{'_'.join(selected_brands[:3])}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            elif "Brand" not in df.columns:
+                st.warning("⚠️ Please upload a Portfolio Report to enable brand filtering.")
+            else:
+                st.warning("⚠️ Please select at least one brand from the sidebar.")
+        
+        # ============= TAB 3: PIVOT TABLE REPORT =============
+        with tab3:
+            st.header("Pivot Table Report - Brand Summary")
+            
+            if "Brand" in df.columns:
+                # Filter data if brands selected
+                if selected_brands:
+                    pivot_source_df = df[df['Brand'].isin(selected_brands)].copy()
+                else:
+                    pivot_source_df = df.copy()
+                
+                # Create pivot table
+                pivot_df = (
+                    pivot_source_df.groupby("Brand", dropna=False)
+                    .agg({
+                        "Campaign": "count",
+                        "Clicks": "sum",
+                        "Amount": "sum",
+                        "With GST Amount (18%)": "sum"
+                    })
+                    .reset_index()
+                    .rename(columns={
+                        "Campaign": "Total Campaigns",
+                        "Clicks": "Total Clicks",
+                        "Amount": "Total Amount (excl. GST)",
+                        "With GST Amount (18%)": "Total Amount (incl. GST)"
+                    })
+                )
+                
+                # Sort by total amount
+                pivot_df = pivot_df.sort_values("Total Amount (incl. GST)", ascending=False)
+                
+                # Add Grand Total
+                grand_total = pd.DataFrame({
+                    'Brand': ['Grand Total'],
+                    'Total Campaigns': [pivot_df['Total Campaigns'].sum()],
+                    'Total Clicks': [pivot_df['Total Clicks'].sum()],
+                    'Total Amount (excl. GST)': [pivot_df['Total Amount (excl. GST)'].sum()],
+                    'Total Amount (incl. GST)': [pivot_df['Total Amount (incl. GST)'].sum()]
+                })
+                pivot_df = pd.concat([pivot_df, grand_total], ignore_index=True)
+                
+                # Display pivot table
+                st.dataframe(
+                    pivot_df.style.format({
+                        'Total Campaigns': '{:,.0f}',
+                        'Total Clicks': '{:,.0f}',
+                        'Total Amount (excl. GST)': '₹{:,.2f}',
+                        'Total Amount (incl. GST)': '₹{:,.2f}'
+                    }).background_gradient(
+                        subset=['Total Amount (incl. GST)'], 
+                        cmap='YlOrRd'
+                    ),
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Visualizations
+                st.subheader("📈 Brand Performance Charts")
+                
+                chart_data = pivot_df[pivot_df['Brand'] != 'Grand Total'].copy()
+                
+                if not chart_data.empty:
+                    col_a, col_b = st.columns(2)
+                    
+                    with col_a:
+                        st.write("**Total Amount by Brand (incl. GST)**")
+                        st.bar_chart(
+                            chart_data.set_index('Brand')['Total Amount (incl. GST)'],
+                            height=300
+                        )
+                    
+                    with col_b:
+                        st.write("**Total Clicks by Brand**")
+                        st.bar_chart(
+                            chart_data.set_index('Brand')['Total Clicks'],
+                            height=300
+                        )
+                
+                # Download pivot table
+                pivot_excel = convert_df_to_excel(pivot_df, 'Pivot Table')
+                st.download_button(
+                    label="📥 Download Pivot Table (Excel)",
+                    data=pivot_excel,
+                    file_name="invoice_pivot_table.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.warning("⚠️ Please upload a Portfolio Report to generate pivot table by brand.")
+                
     else:
         st.error("❌ No data could be extracted from the uploaded files.")
+
+else:
+    # Instructions
+    st.info("👆 Please upload PDF invoice files to get started")
+    
+    st.markdown("""
+    ### Instructions:
+    
+    1. **Upload Invoice PDFs**: Upload one or more Amazon invoice PDF files
+    2. **Upload Portfolio Report** (Optional): Excel file containing Campaign and Brand columns for brand mapping
+    3. **Process**: The app will extract invoice data and map brands automatically
+    4. **View Reports**:
+       - **Master Report**: Complete dataset with all invoices
+       - **Brand Filtered Report**: Filter by selected brands
+       - **Pivot Table Report**: Summary statistics by brand
+    5. **Download**: Each report can be downloaded as Excel
+    
+    ### Features:
+    - Automatic campaign name cleaning
+    - Total amount extraction from invoice summary
+    - Brand mapping from portfolio report
+    - GST calculation (18%)
+    - Multi-brand filtering
+    - Comprehensive reporting
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("*Invoice Data Master Dashboard (Support Advertisment) - Version 2.0*")
